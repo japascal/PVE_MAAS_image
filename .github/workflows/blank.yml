@@ -1,0 +1,218 @@
+name: Build Proxmox VE 9 MAAS Image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      pve_version:
+        description: 'PVE version label (for artifact naming)'
+        required: false
+        default: '9.1'
+
+env:
+  PVE_VERSION: ${{ github.event.inputs.pve_version || '9.1' }}
+
+jobs:
+  build:
+    name: Build PVE ${{ github.event.inputs.pve_version || '9.1' }} MAAS Image
+    runs-on: ubuntu-22.04
+
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. 清理磁碟空間 (釋放約 30GB，解決 No space left 問題) ─────────────
+      - name: Free up disk space
+        run: |
+          echo "=== 執行空間清理 ==="
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo apt-get clean
+          df -h
+
+      # ── 3. 安裝系統依賴工具 ──────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cpu-checker qemu-kvm dos2unix
+
+      # ── 4. 修正 /dev/kvm 權限 ────────────────────────────────────────────
+      - name: Fix /dev/kvm permissions
+        run: |
+          sudo chmod 666 /dev/kvm
+          kvm-ok || echo "⚠ kvm-ok failed (may still work)"
+
+      # ── 5. 載入 FUSE 核心模組 ────────────────────────────────────────────
+      - name: Load FUSE kernel module
+        run: |
+          sudo modprobe fuse
+          ls -la /dev/fuse
+
+      # ── 6. 取得 KVM_GID ──────────────────────────────────────────────────
+      - name: Export KVM_GID
+        run: |
+          KVM_GID=$(getent group kvm | cut -d: -f3)
+          echo "KVM_GID=${KVM_GID}" >> $GITHUB_ENV
+
+      # ── 7. Clone MAAS-Proxmox 原始碼 ─────────────────────────────────────
+      - name: Clone MAAS-Proxmox builder
+        run: |
+          git clone --depth=1 https://github.com/luis15pt/MAAS-Proxmox.git maas-proxmox
+
+      # ── 8. Build Docker builder image ────────────────────────────────────
+      - name: Build Docker builder image
+        working-directory: maas-proxmox
+        run: |
+          docker build --tag pve-maas-builder:latest -f Dockerfile .
+
+      # ── 9. 執行 PVE MAAS image build (核心步驟) ──────────────────────────
+      - name: Build PVE ${{ env.PVE_VERSION }} MAAS image
+        working-directory: maas-proxmox
+        timeout-minutes: 90
+        run: |
+          echo "=== 開始打包 PVE ${{ env.PVE_VERSION }} MAAS Image ==="
+          
+          # 1. 解決 CRLF 換行符號問題
+          find . -type f -name "*.sh" -exec dos2unix {} + 2>/dev/null || true
+          find . -type f -name "fuse-nbd" -exec dos2unix {} + 2>/dev/null || true
+          
+          # 2. 解決所有權限問題
+          chmod -R 777 .
+          find scripts/ -type f -exec chmod +x {} + 2>/dev/null || true
+          find debian/scripts/ -type f -exec chmod +x {} + 2>/dev/null || true
+
+          # 3. 強制關閉宿主機 IPv6 以避開網路黑洞
+          echo "=== 強制關閉 IPv6 ==="
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
+
+          # 4. 執行 Docker 容器
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "====================================================="
+            echo "🚀 嘗試建置 (第 $i 次 / 共 $MAX_RETRIES 次)"
+            echo "====================================================="
+            
+            # 👇 移除 --sysctl，因為 --net=host 會直接繼承上方已關閉 IPv6 的宿主機網路
+            if docker run --rm \
+              --net=host \
+              --privileged \
+              --device /dev/kvm:/dev/kvm \
+              --device /dev/fuse:/dev/fuse \
+              --security-opt apparmor=unconfined \
+              --tmpfs /tmp:exec,size=8g \
+              -e KVM_GID=${KVM_GID} \
+              -v ${{ github.workspace }}/maas-proxmox:/build \
+              pve-maas-builder:latest; then
+              
+              echo "✅ 建置成功！"
+              break # 成功就跳出迴圈
+              
+            else
+              echo "❌ 第 $i 次建置失敗。"
+              if [ $i -eq $MAX_RETRIES ]; then
+                echo "⚠ 已達最大重試次數，放棄建置。"
+                exit 1
+              fi
+              echo "⏳ 等待 30 秒後進行下一次重試..."
+              sleep 30
+            fi
+          done
+
+      # ── 10. 驗證輸出並取得檔案路徑 ───────────────────────────────────────
+      - name: Verify build output
+        run: |
+          # 尋找產生出來的 tar.gz 檔案
+          OUTPUT=$(find ./maas-proxmox -name "proxmox-ve-*.tar.gz" | head -1)
+          if [ -z "$OUTPUT" ]; then
+            echo "❌ Build output not found!"
+            find ./maas-proxmox -name "*.tar.gz"
+            exit 1
+          fi
+          SIZE=$(du -sh "$OUTPUT" | cut -f1)
+          echo "✓ 檔案已產生: $OUTPUT ($SIZE)"
+          echo "OUTPUT_FILE=${OUTPUT}" >> $GITHUB_ENV
+          echo "OUTPUT_FILENAME=$(basename $OUTPUT)" >> $GITHUB_ENV
+
+      # ── 11. 優先嘗試上傳到 GitHub Artifact ─────────────────────────────────
+      - name: Upload MAAS image to GitHub Artifact
+        id: gh_artifact
+        uses: actions/upload-artifact@v4
+        continue-on-error: true   # 👈 關鍵：配額滿了會報錯，但讓流程繼續往下走
+        with:
+          name: pve-${{ env.PVE_VERSION }}-maas-${{ github.run_number }}
+          path: ${{ env.OUTPUT_FILE }}
+          retention-days: 1
+
+      # ── 12. 備用方案：自動尋找可用的免費暫存空間 ───────────
+      - name: Fallback to Temporary Cloud
+        id: fallback_upload
+        if: steps.gh_artifact.outcome == 'failure' 
+        run: |
+          echo "⚠️ GitHub Artifact 上傳失敗 (可能配額已滿)。"
+          echo "🔄 啟動備用方案：自動尋找可用的免費上傳空間..."
+          
+          DOWNLOAD_LINK=""
+          
+          # 備援 A: 嘗試 temp.sh (支援最大 4GB，保留 3 天)
+          echo "▶ 嘗試上傳至 temp.sh..."
+          UPLOAD_LOG=$(curl -s -k -T "${{ env.OUTPUT_FILE }}" "https://temp.sh")
+          echo "回傳結果: $UPLOAD_LOG"
+          DOWNLOAD_LINK=$(echo "$UPLOAD_LOG" | grep -Eo 'https://temp.sh/[^ ]+' | head -1)
+          
+          # 備援 B: 若 temp.sh 失敗，改用 oshi.at (支援最大 5GB，保留 90 天)
+          if [ -z "$DOWNLOAD_LINK" ]; then
+            echo "▶ temp.sh 無回應，切換至 oshi.at..."
+            UPLOAD_LOG=$(curl -s -k -T "${{ env.OUTPUT_FILE }}" "https://oshi.at/${{ env.OUTPUT_FILENAME }}")
+            echo "回傳結果: $UPLOAD_LOG"
+            # oshi.at 會回傳包含 DL: https://oshi.at/... 的字串
+            DOWNLOAD_LINK=$(echo "$UPLOAD_LOG" | grep -Eo 'https://oshi.at/[a-zA-Z0-9]+/[^ >]+' | head -1 || echo "$UPLOAD_LOG" | grep -Eo 'https://oshi.at/[a-zA-Z0-9]+' | head -1)
+          fi
+          
+          # 最終結果判定
+          if [ -z "$DOWNLOAD_LINK" ]; then
+            DOWNLOAD_LINK="上傳失敗，所有的免費空間都罷工了 😭"
+            echo "❌ 所有備用伺服器皆上傳失敗。"
+          else
+            echo "✅ 成功取得備用下載連結: $DOWNLOAD_LINK"
+          fi
+          
+          # 寫入環境變數供 Step 13 (Summary) 使用
+          echo "DOWNLOAD_LINK=$DOWNLOAD_LINK" >> $GITHUB_ENV
+
+      # ── 13. 產生 Summary 報告 ──────────────────────────────────────────
+      - name: Write Job Summary
+        if: always()
+        run: |
+          {
+            echo "## 📦 Proxmox VE MAAS Image 準備就緒"
+            echo ""
+            
+            # 根據前面的成功與否，顯示不同的提示
+            if [ "${{ steps.gh_artifact.outcome }}" == "success" ]; then
+              echo "✅ **檔案已成功上傳至 GitHub Artifacts！**"
+              echo "請捲動到此頁面最下方（Artifacts 區塊）點擊下載。"
+            else
+              echo "⚠️ *GitHub Artifact 空間不足，已啟用備用下載連結：*"
+              echo "**👉 [點擊這裡下載 ${{ env.OUTPUT_FILENAME }}](${{ env.DOWNLOAD_LINK }})**"
+            fi
+            
+            echo ""
+            echo "### 匯入 MAAS 的指令："
+            echo '```bash'
+            echo "sudo maas admin boot-resources create \\"
+            echo "  name='custom/proxmox-ve-9.1' \\"
+            echo "  architecture='amd64/generic' \\"
+            echo "  filetype='tgz' \\"
+            echo "  content@=${{ env.OUTPUT_FILENAME }}"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
