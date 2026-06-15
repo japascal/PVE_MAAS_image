@@ -85,24 +85,30 @@ jobs:
           find . -type f -name "*.sh" -exec dos2unix {} + 2>/dev/null || true
           find . -type f -name "fuse-nbd" -exec dos2unix {} + 2>/dev/null || true
           
-          # 2. 解決所有權限問題
+          # 2. 強制將 Debian 下載網址改為 HTTPS (視你需要決定是否保留)
+          find . -type f -name "*.pkr.hcl" -exec sed -i 's|http://cloud.debian.org|https://cloud.debian.org|g' {} +
+          
+          # 👇 3. 關鍵修復：移除 tar 打包時會造成 MAAS 部署崩潰的參數
+          echo "=== 移除 tar 指令中的 acls, selinux, xattrs 參數 ==="
+          find scripts/ -type f -exec sed -i -e 's/--acls//g' -e 's/--selinux//g' -e 's/--xattrs//g' {} +
+          
+          # 4. 解決所有權限問題
           chmod -R 777 .
           find scripts/ -type f -exec chmod +x {} + 2>/dev/null || true
           find debian/scripts/ -type f -exec chmod +x {} + 2>/dev/null || true
 
-          # 3. 強制關閉宿主機 IPv6 以避開網路黑洞
+          # 5. 強制關閉宿主機 IPv6 以避開網路黑洞
           echo "=== 強制關閉 IPv6 ==="
           sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
           sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
 
-          # 4. 執行 Docker 容器
+          # 6. 執行 Docker 容器
           MAX_RETRIES=3
           for i in $(seq 1 $MAX_RETRIES); do
             echo "====================================================="
             echo "🚀 嘗試建置 (第 $i 次 / 共 $MAX_RETRIES 次)"
             echo "====================================================="
             
-            # 👇 移除 --sysctl，因為 --net=host 會直接繼承上方已關閉 IPv6 的宿主機網路
             if docker run --rm \
               --net=host \
               --privileged \
